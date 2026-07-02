@@ -564,9 +564,13 @@ function updateExport() {
     el.connBreakdown.appendChild(line);
   });
   const suffix = state.unit === "in" ? '"' : "mm";
-  el.dowelBreakdown.textContent = parts.dowels.byLength
-    .map((d) => `${d.count} × ${d.length}${suffix}`)
-    .join("   ");
+  // One dowel length per line — this is a pick list for printing.
+  el.dowelBreakdown.textContent = "";
+  parts.dowels.byLength.forEach((d) => {
+    const line = document.createElement("div");
+    line.textContent = `${d.count} × ${d.length}${suffix}`;
+    el.dowelBreakdown.appendChild(line);
+  });
 }
 
 el.copyBtn.addEventListener("click", async () => {
