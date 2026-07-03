@@ -13,10 +13,24 @@ const state = {
   squareSize: 13.5, // max printable square edge; linked to the divisions count (4 divisions @ width 54)
   brace: "identity", // math function that shapes each square cell's diagonal brace ("off" = none)
   braceFlip: true,   // mirror the brace across the cell (flips "/" <-> "\"); true = "\" (left) by default
-  rows: false,       // horizontal shelf decks at each interior level
-  columns: false,    // vertical partitions at each interior width cut
+  // "Skip" is a stride: 0 = every interior cut gets a deck/partition, 1 =
+  // every other, 2 = every 3rd, ... up to maxRowSkip/maxColSkip (the count
+  // of interior cuts) = none at all. 999 is a sentinel that always clamps
+  // down to "none" for the current geometry, matching the old rows/columns
+  // default of off.
+  rowSkip: 999,
+  colSkip: 999,
   openFront: true,  // drop the +Z face's infill so it reads as a usable shelf
 };
+
+// Interior-cut counts for the rows/columns skip pad — depend only on the
+// box dimensions and square size, so callable without rebuilding the frame.
+function maxRowSkip() {
+  return Math.max(0, axisCuts(state.height).length - 2);
+}
+function maxColSkip() {
+  return Math.max(0, axisCuts(state.width).length - 2);
+}
 
 // Math functions available as cell braces. Each is a printed curved member
 // (see buildBraceLocal) that kinks to 45 degrees at its ends so it seats
@@ -143,6 +157,7 @@ let edges = []; // [nodeIndexA, nodeIndexB] — straight structural dowels
 let braceSegs = [];       // flat list of [Vec3, Vec3] cylinder segments for curved braces
 let braceTypeCounts = {}; // brace function key -> count of cells using it
 let armDirs = []; // parallel to nodes — unit vectors of each connector's arms
+let effRowSkip = 0, effColSkip = 0; // state.rowSkip/colSkip clamped to the current geometry
 
 // A brace lives in a unit (u,v) cell, v = up, spanning [0,1]x[0,1]. Returns
 // { segs, arms }: segs is the polyline(s) to render as cylinders (each a
@@ -253,11 +268,12 @@ function axisCuts(length) {
 }
 
 // Segments exist where they lie on a rendered plane: always the six faces;
-// with rows on, also the horizontal planes at each interior height cut
-// (shelf decks); with columns on, the vertical planes at each interior
-// width cut (partitions). Shared segments are emitted once — the include
-// conditions are OR'd, never duplicated. Nodes are created lazily from the
-// segments that use them, so no orphan connectors appear in the parts list.
+// plus, per the rows/columns skip pad, the horizontal planes at selected
+// interior height cuts (shelf decks) and the vertical planes at selected
+// interior width cuts (partitions). Shared segments are emitted once — the
+// include conditions are OR'd, never duplicated. Nodes are created lazily
+// from the segments that use them, so no orphan connectors appear in the
+// parts list.
 //
 // Open Front drops the infill on the +Z face (the face toward the default
 // camera) so the box reads as a usable shelf. Only the interior grid on
@@ -267,9 +283,27 @@ function generateFrame() {
   const L = state.width, H = state.height, W = state.depth;
   const xs = axisCuts(L), ys = axisCuts(H), zs = axisCuts(W);
   const onB = (v, max) => v < MERGE_TOL || v > max - MERGE_TOL;
-  const { rows, columns, brace, braceFlip, openFront } = state;
+  const { brace, braceFlip, openFront } = state;
   const isFront = (k) => k === zs.length - 1;
   const zClosed = (k) => onB(zs[k], W) && !(openFront && isFront(k));
+
+  // Row/column skip selection: boundary indices always included; interior
+  // indices included every (skip+1)-th position, starting from the first,
+  // until skip reaches the interior count, at which point none qualify.
+  const numRowInterior = Math.max(0, ys.length - 2);
+  const numColInterior = Math.max(0, xs.length - 2);
+  effRowSkip = Math.min(state.rowSkip, numRowInterior);
+  effColSkip = Math.min(state.colSkip, numColInterior);
+  const rowsInclude = (j) => {
+    if (j === 0 || j === ys.length - 1) return true;
+    if (effRowSkip >= numRowInterior) return false;
+    return (j - 1) % (effRowSkip + 1) === 0;
+  };
+  const colsInclude = (i) => {
+    if (i === 0 || i === xs.length - 1) return true;
+    if (effColSkip >= numColInterior) return false;
+    return (i - 1) % (effColSkip + 1) === 0;
+  };
 
   nodes = [];
   edges = [];
@@ -293,11 +327,11 @@ function generateFrame() {
   for (let i = 0; i < xs.length; i++) {
     for (let j = 0; j < ys.length; j++) {
       for (let k = 0; k < zs.length; k++) {
-        if (i + 1 < xs.length && (onB(ys[j], H) || zClosed(k) || rows))
+        if (i + 1 < xs.length && (rowsInclude(j) || zClosed(k)))
           addEdge([i, j, k], [i + 1, j, k]);
-        if (j + 1 < ys.length && (onB(xs[i], L) || zClosed(k) || columns))
+        if (j + 1 < ys.length && (colsInclude(i) || zClosed(k)))
           addEdge([i, j, k], [i, j + 1, k]);
-        if (k + 1 < zs.length && (onB(xs[i], L) || onB(ys[j], H) || rows || columns))
+        if (k + 1 < zs.length && (rowsInclude(j) || colsInclude(i)))
           addEdge([i, j, k], [i, j, k + 1]);
       }
     }
@@ -348,7 +382,7 @@ function generateFrame() {
     }
     // Side faces + column partitions (z-y planes; u = z, v = y up).
     for (let i = 0; i < xs.length; i++) {
-      if (!(onB(xs[i], L) || columns)) continue;
+      if (!colsInclude(i)) continue;
       for (let k = 0; k + 1 < zs.length; k++)
         for (let j = 0; j + 1 < ys.length; j++)
           if (isSquare(zs[k + 1] - zs[k], ys[j + 1] - ys[j]))
@@ -356,7 +390,7 @@ function generateFrame() {
     }
     // Top/bottom faces + row decks (x-z planes; u = x, v = z).
     for (let j = 0; j < ys.length; j++) {
-      if (!(onB(ys[j], H) || rows)) continue;
+      if (!rowsInclude(j)) continue;
       for (let i = 0; i + 1 < xs.length; i++)
         for (let k = 0; k + 1 < zs.length; k++)
           if (isSquare(xs[i + 1] - xs[i], zs[k + 1] - zs[k]))
@@ -495,8 +529,9 @@ const el = {
   connBreakdown: document.getElementById("connBreakdown"),
   braceSel: document.getElementById("braceSel"),
   braceFlip: document.getElementById("braceFlip"),
-  rowsBtn: document.getElementById("rowsBtn"),
-  colsBtn: document.getElementById("colsBtn"),
+  rcCanvas: document.getElementById("rcCanvas"),
+  colSkipVal: document.getElementById("colSkipVal"),
+  rowSkipVal: document.getElementById("rowSkipVal"),
   openFrontBtn: document.getElementById("openFrontBtn"),
   dowelCount: document.getElementById("dowelCount"),
   dowelBreakdown: document.getElementById("dowelBreakdown"),
@@ -659,6 +694,118 @@ el.padCanvas.addEventListener("pointermove", (e) => {
   if (e.buttons) padDrag(e);
 });
 
+// ---------- rows/columns skip pad ----------
+// X = column skip (interior width cuts), Y = row skip (interior height
+// cuts). Independent axes, unlike the tiling pad — every (col, row)
+// combination is a valid, distinct state, so no link curve to draw.
+// Bottom-left (0,0) = every interior cut gets a deck/partition (fully on);
+// top-right (max,max) = none at all (fully off).
+
+function rcPadMetrics() {
+  const cw = el.rcCanvas.clientWidth;
+  const ch = el.rcCanvas.clientHeight;
+  const mL = 10, mR = 8, mT = 10, mB = 10;
+  const maxC = maxColSkip(), maxR = maxRowSkip();
+  const cToX = (c) => (maxC === 0 ? mL + (cw - mL - mR) / 2 : mL + (c / maxC) * (cw - mL - mR));
+  const xToC = (x) => (maxC === 0 ? 0 : Math.round(((x - mL) / (cw - mL - mR)) * maxC));
+  const rToY = (r) => (maxR === 0 ? ch - mB - (ch - mT - mB) / 2 : ch - mB - (r / maxR) * (ch - mT - mB));
+  const yToR = (y) => (maxR === 0 ? 0 : Math.round(((ch - mB - y) / (ch - mT - mB)) * maxR));
+  return { cw, ch, maxC, maxR, cToX, xToC, rToY, yToR };
+}
+
+function drawRowColPad() {
+  const canvas = el.rcCanvas;
+  const { cw, ch, maxC, maxR, cToX, rToY } = rcPadMetrics();
+  const dpr = Math.min(window.devicePixelRatio, 2);
+  if (canvas.width !== cw * dpr || canvas.height !== ch * dpr) {
+    canvas.width = cw * dpr;
+    canvas.height = ch * dpr;
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cw, ch);
+
+  ctx.fillStyle = "rgba(255,255,255,0.04)";
+  ctx.fillRect(0, 0, cw, ch);
+
+  // Stepwise grid — one line per integer skip value on each axis.
+  ctx.strokeStyle = "rgba(255,255,255,0.08)";
+  ctx.lineWidth = 1;
+  for (let c = 0; c <= maxC; c++) {
+    ctx.beginPath();
+    ctx.moveTo(cToX(c), 0);
+    ctx.lineTo(cToX(c), ch);
+    ctx.stroke();
+  }
+  for (let r = 0; r <= maxR; r++) {
+    ctx.beginPath();
+    ctx.moveTo(0, rToY(r));
+    ctx.lineTo(cw, rToY(r));
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = "rgba(140,134,114,0.8)";
+  ctx.font = "9px -apple-system, sans-serif";
+  ctx.textAlign = "right";
+  ctx.fillText("col skip →", cw - 6, ch - 2);
+  ctx.textAlign = "left";
+  ctx.fillText("↑ row skip", 4, 10);
+
+  const colSkip = Math.min(state.colSkip, maxC);
+  const rowSkip = Math.min(state.rowSkip, maxR);
+  const hx = cToX(colSkip), hy = rToY(rowSkip);
+  ctx.beginPath();
+  ctx.arc(hx, hy, 5, 0, Math.PI * 2);
+  ctx.fillStyle = "#f2b64c";
+  ctx.fill();
+  ctx.strokeStyle = "#14140f";
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+}
+
+function rcPadDrag(e) {
+  const rect = el.rcCanvas.getBoundingClientRect();
+  const px = e.clientX - rect.left;
+  const py = e.clientY - rect.top;
+  const { xToC, yToR, maxC, maxR } = rcPadMetrics();
+  state.colSkip = Math.max(0, Math.min(maxC, xToC(px)));
+  state.rowSkip = Math.max(0, Math.min(maxR, yToR(py)));
+  rebuildScene();
+  updateLabels();
+}
+
+el.rcCanvas.addEventListener("pointerdown", (e) => {
+  el.rcCanvas.setPointerCapture(e.pointerId);
+  rcPadDrag(e);
+});
+el.rcCanvas.addEventListener("pointermove", (e) => {
+  if (e.buttons) rcPadDrag(e);
+});
+
+function commitSkip(input, key, maxFn) {
+  const raw = parseFloat(input.value);
+  if (Number.isNaN(raw)) {
+    updateLabels();
+    return;
+  }
+  state[key] = Math.max(0, Math.min(maxFn(), Math.round(raw)));
+  rebuildScene();
+  updateLabels();
+}
+function bindSkipInput(input, key, maxFn) {
+  input.addEventListener("blur", () => commitSkip(input, key, maxFn));
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") input.blur();
+    if (e.key === "Escape") {
+      updateLabels();
+      input.blur();
+    }
+  });
+  input.addEventListener("focus", () => input.select());
+}
+bindSkipInput(el.colSkipVal, "colSkip", maxColSkip);
+bindSkipInput(el.rowSkipVal, "rowSkip", maxRowSkip);
+
 // ---------- parts export ----------
 
 // Classify a connector by its incident dowel directions (unit vectors).
@@ -732,8 +879,8 @@ function computeParts() {
     structure: {
       brace: state.brace,
       braceFlip: state.braceFlip,
-      rows: state.rows,
-      columns: state.columns,
+      rowSkip: effRowSkip,
+      colSkip: effColSkip,
       openFront: state.openFront,
     },
     connectors: {
@@ -908,6 +1055,9 @@ function updateLabels() {
     state.unit === "in" ? `${(s * MM_PER_INCH).toFixed(0)}mm` : `${s.toFixed(2)}"`;
   el.divVal.value = currentDivisions();
   drawPad();
+  el.colSkipVal.value = Math.min(state.colSkip, maxColSkip());
+  el.rowSkipVal.value = Math.min(state.rowSkip, maxRowSkip());
+  drawRowColPad();
   updateExport();
   updateFilename();
 }
@@ -1002,8 +1152,6 @@ function syncStructureUI() {
   el.braceSel.value = state.brace;
   el.braceFlip.textContent = state.braceFlip ? "\\" : "/";
   el.braceFlip.disabled = state.brace === "off";
-  el.rowsBtn.classList.toggle("active", state.rows);
-  el.colsBtn.classList.toggle("active", state.columns);
   el.openFrontBtn.classList.toggle("active", state.openFront);
   el.openFrontBtn.textContent = state.openFront ? "On" : "Off";
 }
@@ -1016,18 +1164,6 @@ el.braceSel.addEventListener("change", () => {
 });
 el.braceFlip.addEventListener("click", () => {
   state.braceFlip = !state.braceFlip;
-  syncStructureUI();
-  rebuildScene();
-  updateLabels();
-});
-el.rowsBtn.addEventListener("click", () => {
-  state.rows = !state.rows;
-  syncStructureUI();
-  rebuildScene();
-  updateLabels();
-});
-el.colsBtn.addEventListener("click", () => {
-  state.columns = !state.columns;
   syncStructureUI();
   rebuildScene();
   updateLabels();
@@ -1062,6 +1198,7 @@ window.addEventListener("resize", () => {
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
   drawPad();
+  drawRowColPad();
 });
 
 function animate() {
