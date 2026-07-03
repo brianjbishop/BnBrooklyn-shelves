@@ -11,8 +11,12 @@ const state = {
   depth: 24,  // Z
   dowelRadius: 0.5, // 1" diameter closet rod default
   squareSize: 13.5, // max printable square edge; linked to the divisions count (4 divisions @ width 54)
-  brace: "identity", // math function that shapes each square cell's diagonal brace ("off" = none)
+  brace: "identity", // math function bracing the six exterior faces ("off" = none)
   braceFlip: true,   // mirror the brace across the cell (flips "/" <-> "\"); true = "\" (left) by default
+  rowBrace: "off",   // math function bracing row-deck cells specifically (independent of the face brace)
+  rowBraceFlip: true,
+  colBrace: "off",   // math function bracing column-partition cells specifically
+  colBraceFlip: true,
   // "Skip" is a stride: 0 = every interior cut gets a deck/partition, 1 =
   // every other, 2 = every 3rd, ... up to maxRowSkip/maxColSkip (the count
   // of interior cuts) = none at all. 999 is a sentinel that always clamps
@@ -165,7 +169,7 @@ let effRowSkip = 0, effColSkip = 0; // state.rowSkip/colSkip clamped to the curr
 // connector, with a local direction that is 45 degrees so the socket seats
 // cleanly. emitBrace maps this onto the real cell (and applies the flip).
 const BRACE_K = 0.14;      // 45-degree stub inset at each end (fraction of the cell)
-const BRACE_SAMPLES = 18;  // interior samples for smooth curves
+const BRACE_SAMPLES = 26;  // interior samples for smooth curves
 
 function bracePolyToSegs(pts) {
   const segs = [];
@@ -233,10 +237,11 @@ function buildBraceLocal(type) {
         return s + A * h;
       });
     case "hyperbola":
-      // Rectangular-hyperbola branch (a Möbius transform of 1/x): quick
-      // rise off the corner, then a long flat asymptotic approach — the
-      // same family as y = 1/x, just the increasing branch.
-      return braceSmooth((s) => (9 * s) / (1 + 8 * s));
+      // Rectangular-hyperbola branch (a Möbius transform of 1/x): a sharp
+      // near-vertical rise right off the corner, then a long flat
+      // asymptotic approach — the same family as y = 1/x, just the
+      // increasing branch, tuned for a dramatic knee like the reference.
+      return braceSmooth((s) => (18 * s) / (1 + 17 * s));
     case "circle": {
       // Ring floating in the middle (touches no side) plus two 45-degree
       // stubs out to opposite corners so it seats into two connectors.
@@ -338,64 +343,80 @@ function generateFrame() {
   }
 
   // Function braces: one per square cell on each rendered plane. Only square
-  // cells qualify (a rectangle can't hold a 45-degree brace). The chosen
-  // math function is built once in unit (u,v) coords, then mapped onto each
-  // cell by emit(): bilinear for the geometry, and the endpoint arms are
-  // registered on the corner connectors so they read as 45-degree sockets.
-  if (brace !== "off") {
-    const isSquare = (a, b) => Math.abs(a - b) < MERGE_TOL;
-    const local = buildBraceLocal(brace);
-    const nodeRef = (i, j, k) => ({
-      id: nodeId(i, j, k),
-      pos: new THREE.Vector3(xs[i] - L / 2, ys[j], zs[k] - W / 2),
-    });
+  // cells qualify (a rectangle can't hold a 45-degree brace). The six
+  // exterior faces use the main "Braces" function; row decks and column
+  // partitions (the interior planes selected by the skip pad) each use
+  // their own independent function, so a shelf can wiggle a Cubic on its
+  // faces while row decks trace a ZigZag, say. Each math function is built
+  // once (cached) in unit (u,v) coords, then mapped onto every qualifying
+  // cell: bilinear for the geometry, and the endpoint arms are registered
+  // on the corner connectors so they read as 45-degree sockets.
+  const isSquare = (a, b) => Math.abs(a - b) < MERGE_TOL;
+  const nodeRef = (i, j, k) => ({
+    id: nodeId(i, j, k),
+    pos: new THREE.Vector3(xs[i] - L / 2, ys[j], zs[k] - W / 2),
+  });
+  const localCache = {};
+  const getLocal = (type) => (localCache[type] ||= buildBraceLocal(type));
 
-    // c = [c00, c10, c01, c11] for cell corners (u,v) = (0,0),(1,0),(0,1),(1,1).
-    const emit = (c) => {
-      const U = (u) => (braceFlip ? 1 - u : u);
-      const to3D = (u, v) => {
-        const uu = U(u);
-        return new THREE.Vector3()
-          .addScaledVector(c[0].pos, (1 - uu) * (1 - v))
-          .addScaledVector(c[1].pos, uu * (1 - v))
-          .addScaledVector(c[2].pos, (1 - uu) * v)
-          .addScaledVector(c[3].pos, uu * v);
-      };
-      local.segs.forEach(([p, q]) =>
-        braceSegs.push([to3D(p[0], p[1]), to3D(q[0], q[1])]));
-      local.arms.forEach(({ at, dir }) => {
-        const id = c[(U(at[0]) ? 1 : 0) + (at[1] ? 2 : 0)].id;
-        const p0 = to3D(at[0], at[1]);
-        const p1 = to3D(at[0] + 0.001 * dir[0], at[1] + 0.001 * dir[1]);
-        braceArms.push({ id, dir: p1.sub(p0).normalize() });
-      });
-      braceTypeCounts[brace] = (braceTypeCounts[brace] || 0) + 1;
+  // c = [c00, c10, c01, c11] for cell corners (u,v) = (0,0),(1,0),(0,1),(1,1).
+  const emit = (c, type, flip) => {
+    const local = getLocal(type);
+    const U = (u) => (flip ? 1 - u : u);
+    const to3D = (u, v) => {
+      const uu = U(u);
+      return new THREE.Vector3()
+        .addScaledVector(c[0].pos, (1 - uu) * (1 - v))
+        .addScaledVector(c[1].pos, uu * (1 - v))
+        .addScaledVector(c[2].pos, (1 - uu) * v)
+        .addScaledVector(c[3].pos, uu * v);
     };
+    local.segs.forEach(([p, q]) =>
+      braceSegs.push([to3D(p[0], p[1]), to3D(q[0], q[1])]));
+    local.arms.forEach(({ at, dir }) => {
+      const id = c[(U(at[0]) ? 1 : 0) + (at[1] ? 2 : 0)].id;
+      const p0 = to3D(at[0], at[1]);
+      const p1 = to3D(at[0] + 0.001 * dir[0], at[1] + 0.001 * dir[1]);
+      braceArms.push({ id, dir: p1.sub(p0).normalize() });
+    });
+    braceTypeCounts[type] = (braceTypeCounts[type] || 0) + 1;
+  };
 
-    // Front/back faces (x-y planes; u = x, v = y up).
+  // Front/back faces (x-y planes; u = x, v = y up) — exterior only.
+  if (brace !== "off") {
     for (let k = 0; k < zs.length; k++) {
       if (!onB(zs[k], W) || (openFront && isFront(k))) continue;
       for (let i = 0; i + 1 < xs.length; i++)
         for (let j = 0; j + 1 < ys.length; j++)
           if (isSquare(xs[i + 1] - xs[i], ys[j + 1] - ys[j]))
-            emit([nodeRef(i, j, k), nodeRef(i + 1, j, k), nodeRef(i, j + 1, k), nodeRef(i + 1, j + 1, k)]);
+            emit([nodeRef(i, j, k), nodeRef(i + 1, j, k), nodeRef(i, j + 1, k), nodeRef(i + 1, j + 1, k)], brace, braceFlip);
     }
-    // Side faces + column partitions (z-y planes; u = z, v = y up).
-    for (let i = 0; i < xs.length; i++) {
-      if (!colsInclude(i)) continue;
+  }
+  // Side faces (exterior i, main brace) + column partitions (interior i
+  // selected by the skip pad, independent colBrace) — z-y planes.
+  for (let i = 0; i < xs.length; i++) {
+    const boundary = i === 0 || i === xs.length - 1;
+    if (!boundary && !colsInclude(i)) continue;
+    const type = boundary ? brace : state.colBrace;
+    const flip = boundary ? braceFlip : state.colBraceFlip;
+    if (type === "off") continue;
+    for (let k = 0; k + 1 < zs.length; k++)
+      for (let j = 0; j + 1 < ys.length; j++)
+        if (isSquare(zs[k + 1] - zs[k], ys[j + 1] - ys[j]))
+          emit([nodeRef(i, j, k), nodeRef(i, j, k + 1), nodeRef(i, j + 1, k), nodeRef(i, j + 1, k + 1)], type, flip);
+  }
+  // Top/bottom faces (exterior j, main brace) + row decks (interior j
+  // selected by the skip pad, independent rowBrace) — x-z planes.
+  for (let j = 0; j < ys.length; j++) {
+    const boundary = j === 0 || j === ys.length - 1;
+    if (!boundary && !rowsInclude(j)) continue;
+    const type = boundary ? brace : state.rowBrace;
+    const flip = boundary ? braceFlip : state.rowBraceFlip;
+    if (type === "off") continue;
+    for (let i = 0; i + 1 < xs.length; i++)
       for (let k = 0; k + 1 < zs.length; k++)
-        for (let j = 0; j + 1 < ys.length; j++)
-          if (isSquare(zs[k + 1] - zs[k], ys[j + 1] - ys[j]))
-            emit([nodeRef(i, j, k), nodeRef(i, j, k + 1), nodeRef(i, j + 1, k), nodeRef(i, j + 1, k + 1)]);
-    }
-    // Top/bottom faces + row decks (x-z planes; u = x, v = z).
-    for (let j = 0; j < ys.length; j++) {
-      if (!rowsInclude(j)) continue;
-      for (let i = 0; i + 1 < xs.length; i++)
-        for (let k = 0; k + 1 < zs.length; k++)
-          if (isSquare(xs[i + 1] - xs[i], zs[k + 1] - zs[k]))
-            emit([nodeRef(i, j, k), nodeRef(i + 1, j, k), nodeRef(i, j, k + 1), nodeRef(i + 1, j, k + 1)]);
-    }
+        if (isSquare(xs[i + 1] - xs[i], zs[k + 1] - zs[k]))
+          emit([nodeRef(i, j, k), nodeRef(i + 1, j, k), nodeRef(i, j, k + 1), nodeRef(i + 1, j, k + 1)], type, flip);
   }
 
   // Arm directions per connector — straight rails plus brace endpoints —
@@ -529,14 +550,17 @@ const el = {
   connBreakdown: document.getElementById("connBreakdown"),
   braceSel: document.getElementById("braceSel"),
   braceFlip: document.getElementById("braceFlip"),
+  rowBraceSel: document.getElementById("rowBraceSel"),
+  rowBraceFlip: document.getElementById("rowBraceFlip"),
+  colBraceSel: document.getElementById("colBraceSel"),
+  colBraceFlip: document.getElementById("colBraceFlip"),
   rcCanvas: document.getElementById("rcCanvas"),
-  colSkipVal: document.getElementById("colSkipVal"),
-  rowSkipVal: document.getElementById("rowSkipVal"),
   openFrontBtn: document.getElementById("openFrontBtn"),
   dowelCount: document.getElementById("dowelCount"),
   dowelBreakdown: document.getElementById("dowelBreakdown"),
   braceCount: document.getElementById("braceCount"),
   braceBreakdown: document.getElementById("braceBreakdown"),
+  rcSkipDisplay: document.getElementById("rcSkipDisplay"),
   fileName: document.getElementById("fileName"),
   copyBtn: document.getElementById("copyBtn"),
   exportBtn: document.getElementById("exportBtn"),
@@ -744,12 +768,12 @@ function drawRowColPad() {
     ctx.stroke();
   }
 
-  ctx.fillStyle = "rgba(140,134,114,0.8)";
-  ctx.font = "9px -apple-system, sans-serif";
-  ctx.textAlign = "right";
-  ctx.fillText("col skip →", cw - 6, ch - 2);
+  ctx.fillStyle = "rgba(242,182,76,0.75)";
+  ctx.font = "bold 11px Menlo, monospace";
   ctx.textAlign = "left";
-  ctx.fillText("↑ row skip", 4, 10);
+  ctx.fillText("R", 4, 12);
+  ctx.textAlign = "right";
+  ctx.fillText("C", cw - 4, ch - 3);
 
   const colSkip = Math.min(state.colSkip, maxC);
   const rowSkip = Math.min(state.rowSkip, maxR);
@@ -781,30 +805,6 @@ el.rcCanvas.addEventListener("pointerdown", (e) => {
 el.rcCanvas.addEventListener("pointermove", (e) => {
   if (e.buttons) rcPadDrag(e);
 });
-
-function commitSkip(input, key, maxFn) {
-  const raw = parseFloat(input.value);
-  if (Number.isNaN(raw)) {
-    updateLabels();
-    return;
-  }
-  state[key] = Math.max(0, Math.min(maxFn(), Math.round(raw)));
-  rebuildScene();
-  updateLabels();
-}
-function bindSkipInput(input, key, maxFn) {
-  input.addEventListener("blur", () => commitSkip(input, key, maxFn));
-  input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") input.blur();
-    if (e.key === "Escape") {
-      updateLabels();
-      input.blur();
-    }
-  });
-  input.addEventListener("focus", () => input.select());
-}
-bindSkipInput(el.colSkipVal, "colSkip", maxColSkip);
-bindSkipInput(el.rowSkipVal, "rowSkip", maxRowSkip);
 
 // ---------- parts export ----------
 
@@ -879,6 +879,10 @@ function computeParts() {
     structure: {
       brace: state.brace,
       braceFlip: state.braceFlip,
+      rowBrace: state.rowBrace,
+      rowBraceFlip: state.rowBraceFlip,
+      colBrace: state.colBrace,
+      colBraceFlip: state.colBraceFlip,
       rowSkip: effRowSkip,
       colSkip: effColSkip,
       openFront: state.openFront,
@@ -933,6 +937,8 @@ function updateExport() {
     line.textContent = `${b.count} × ${b.type}`;
     el.braceBreakdown.appendChild(line);
   });
+  // Rows/columns skip readout — the pad itself no longer spells this out.
+  el.rcSkipDisplay.textContent = `R${parts.structure.rowSkip} · C${parts.structure.colSkip}`;
 }
 
 function flashButton(btn, label) {
@@ -1055,8 +1061,6 @@ function updateLabels() {
     state.unit === "in" ? `${(s * MM_PER_INCH).toFixed(0)}mm` : `${s.toFixed(2)}"`;
   el.divVal.value = currentDivisions();
   drawPad();
-  el.colSkipVal.value = Math.min(state.colSkip, maxColSkip());
-  el.rowSkipVal.value = Math.min(state.rowSkip, maxRowSkip());
   drawRowColPad();
   updateExport();
   updateFilename();
@@ -1152,22 +1156,33 @@ function syncStructureUI() {
   el.braceSel.value = state.brace;
   el.braceFlip.textContent = state.braceFlip ? "\\" : "/";
   el.braceFlip.disabled = state.brace === "off";
+  el.rowBraceSel.value = state.rowBrace;
+  el.rowBraceFlip.textContent = state.rowBraceFlip ? "\\" : "/";
+  el.rowBraceFlip.disabled = state.rowBrace === "off";
+  el.colBraceSel.value = state.colBrace;
+  el.colBraceFlip.textContent = state.colBraceFlip ? "\\" : "/";
+  el.colBraceFlip.disabled = state.colBrace === "off";
   el.openFrontBtn.classList.toggle("active", state.openFront);
-  el.openFrontBtn.textContent = state.openFront ? "On" : "Off";
 }
 
-el.braceSel.addEventListener("change", () => {
-  state.brace = el.braceSel.value;
-  syncStructureUI();
-  rebuildScene();
-  updateLabels();
-});
-el.braceFlip.addEventListener("click", () => {
-  state.braceFlip = !state.braceFlip;
-  syncStructureUI();
-  rebuildScene();
-  updateLabels();
-});
+function bindBraceControl(sel, flipBtn, braceKey, flipKey) {
+  sel.addEventListener("change", () => {
+    state[braceKey] = sel.value;
+    syncStructureUI();
+    rebuildScene();
+    updateLabels();
+  });
+  flipBtn.addEventListener("click", () => {
+    state[flipKey] = !state[flipKey];
+    syncStructureUI();
+    rebuildScene();
+    updateLabels();
+  });
+}
+bindBraceControl(el.braceSel, el.braceFlip, "brace", "braceFlip");
+bindBraceControl(el.rowBraceSel, el.rowBraceFlip, "rowBrace", "rowBraceFlip");
+bindBraceControl(el.colBraceSel, el.colBraceFlip, "colBrace", "colBraceFlip");
+
 el.openFrontBtn.addEventListener("click", () => {
   state.openFront = !state.openFront;
   syncStructureUI();

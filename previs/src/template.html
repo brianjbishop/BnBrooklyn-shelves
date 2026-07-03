@@ -285,13 +285,13 @@
     max-width: 108px;
   }
   .diagGroup select:focus { outline: none; border-color: #f2b64c; }
-  #braceFlip {
+  #braceFlip, #rowBraceFlip, #colBraceFlip {
     width: 30px;
     font-family: Menlo, monospace;
     font-weight: 700;
     font-size: 13px;
   }
-  #braceFlip:disabled { opacity: 0.35; cursor: default; }
+  #braceFlip:disabled, #rowBraceFlip:disabled, #colBraceFlip:disabled { opacity: 0.35; cursor: default; }
   #seriesNav {
     position: fixed;
     top: 0;
@@ -393,7 +393,7 @@
 
 <div id="panel">
   <h1>Cartesian Shelf</h1>
-  <p class="sub">v14 — rows/columns skip pad</p>
+  <p class="sub">v15 — per-plane braces, drastic hyperbola</p>
 
   <div id="units">
     <button id="unit-in" class="active">inches</button>
@@ -455,13 +455,43 @@
       <button class="onoff" id="braceFlip" title="Flip orientation">/</button>
     </div>
   </div>
+  <div class="srow"><span>Row Brace</span>
+    <div class="diagGroup">
+      <select id="rowBraceSel">
+        <option value="off">Off</option>
+        <option value="identity">Identity</option>
+        <option value="quadratic">Quadratic</option>
+        <option value="abs">Absolute Value</option>
+        <option value="zigzag">ZigZag</option>
+        <option value="exponential">Exponential</option>
+        <option value="cubic">Cubic</option>
+        <option value="hyperbola">Hyperbola</option>
+        <option value="circle">Unit Circle</option>
+      </select>
+      <button class="onoff" id="rowBraceFlip" title="Flip orientation">/</button>
+    </div>
+  </div>
+  <div class="srow"><span>Col Brace</span>
+    <div class="diagGroup">
+      <select id="colBraceSel">
+        <option value="off">Off</option>
+        <option value="identity">Identity</option>
+        <option value="quadratic">Quadratic</option>
+        <option value="abs">Absolute Value</option>
+        <option value="zigzag">ZigZag</option>
+        <option value="exponential">Exponential</option>
+        <option value="cubic">Cubic</option>
+        <option value="hyperbola">Hyperbola</option>
+        <option value="circle">Unit Circle</option>
+      </select>
+      <button class="onoff" id="colBraceFlip" title="Flip orientation">/</button>
+    </div>
+  </div>
   <div class="rcPad">
     <div class="rcPadHead">Rows × Columns</div>
     <canvas id="rcCanvas"></canvas>
-    <div class="padrow"><span>Col skip</span><input class="val" id="colSkipVal" type="text" inputmode="numeric" /></div>
-    <div class="padrow"><span>Row skip</span><input class="val" id="rowSkipVal" type="text" inputmode="numeric" /></div>
   </div>
-  <div class="srow"><span>Open Front</span><button class="onoff" id="openFrontBtn">Off</button></div>
+  <div class="srow"><button class="onoff wide" id="openFrontBtn">Open Front</button></div>
 </div>
 
 <div id="export">
@@ -472,6 +502,7 @@
   <div class="breakdown" id="dowelBreakdown"></div>
   <div class="count">Braces <span class="n" id="braceCount"></span></div>
   <div class="breakdown" id="braceBreakdown"></div>
+  <div class="count">Rows/Cols <span class="n" id="rcSkipDisplay"></span></div>
   <input type="text" id="fileName" spellcheck="false" />
   <div class="exportBtns">
     <button id="copyBtn">Copy JSON</button>
