@@ -29,7 +29,30 @@ const state = {
   rowSkip: 999,
   colSkip: 999,
   openFront: true,  // drop the +Z face's infill so it reads as a usable shelf
+
+  connectorType: "T", // "T" (hub + socket stubs) | "blob" (solid rounded mass, no stubs)
+  connectorColor: 0x0d0d0d,
+  dowelColor: 0xd8b98a,
+  braceColor: 0x9b6bd6,    // Depth (front/back) braces
+  rowBraceColor: 0x9b6bd6,
+  colBraceColor: 0x9b6bd6,
+
+  // Per-element removal, keyed by stable position-derived strings (not
+  // array index — index order shifts across rebuilds, position doesn't,
+  // as long as the element's geometry didn't itself move). Toggled via
+  // click in the 3D view; excluded from parts counts/export.
+  removedConnectors: new Set(),
+  removedDowels: new Set(),
+  removedBraces: new Set(),
 };
+
+// Shared "recently used" color history across every picker in the app
+// (connector/dowel/3 brace slots) — session-only, not saved to project files.
+let recentColors = [];
+function pushRecentColor(hex) {
+  const h = hex.toLowerCase();
+  recentColors = [h, ...recentColors.filter((c) => c !== h)].slice(0, 12);
+}
 
 // Interior-cut counts for the rows/columns skip pad — depend only on the
 // box dimensions and square size, so callable without rebuilding the frame.
@@ -138,16 +161,36 @@ function makeShaderMaterial(colorHex, rimHex = 0xf2b64c) {
 // connectors_v1 hardware (36mm hub / 25.4mm dowel ≈ 1.4×) — the hub should
 // read as a distinct bulge the dowel plugs into, not a smaller ball joint.
 const HUB_TO_DOWEL_RATIO = 1.4;
+// "Blob" connector mode has no protruding stubs, so the hub itself needs to
+// read as a solid rounded mass covering where sockets would radiate out —
+// bigger than the T-mode hub, which relies on stubs for that visual bulk.
+const BLOB_TO_DOWEL_RATIO = 2.0;
 // Socket "collars" (short stub cylinders per arm) read slightly thicker
 // than the dowel they wrap, and extend a fraction of the hub radius.
 const STUB_RADIUS_RATIO = 1.15;
 const STUB_LENGTH_RATIO = 1.3;
 
-// Black body with a white rim light — the black print material stays
-// readable as a silhouette against the dark scene even without direct color.
-const connectorMaterial = makeShaderMaterial(0x0d0d0d, 0xffffff);
-const edgeMaterial = makeShaderMaterial(0xd8b98a, 0xf2b64c); // dowel wood tone
-const braceMaterial = makeShaderMaterial(0x9b6bd6, 0xf2b64c); // function-brace accent (purple)
+// User-colorable per element kind (connector / dowel / each brace slot).
+// White rim light by default — a black connector body stays readable as a
+// silhouette against the dark scene even without direct color.
+const connectorMaterial = makeShaderMaterial(state.connectorColor, 0xffffff);
+const edgeMaterial = makeShaderMaterial(state.dowelColor, 0xf2b64c);
+const braceMaterialBySlot = {
+  depth: makeShaderMaterial(state.braceColor, 0xf2b64c),
+  row: makeShaderMaterial(state.rowBraceColor, 0xf2b64c),
+  col: makeShaderMaterial(state.colBraceColor, 0xf2b64c),
+};
+// Shared "removed" ghost appearance — one neutral gray regardless of kind,
+// so a removed part reads as a consistent, deliberate absence.
+const grayMaterial = makeShaderMaterial(0x57544a, 0x8a8672);
+// Backface-shell outline: a slightly-scaled duplicate rendered back-face-only
+// reads as a rim around the original mesh — cheap, no post-processing pass,
+// fits the existing pooled-mesh render loop untouched.
+const outlineMaterial = new THREE.MeshBasicMaterial({ color: 0xf2b64c, side: THREE.BackSide });
+
+function setMaterialColor(mat, hex) {
+  mat.uniforms.baseColor.value.set(hex);
+}
 
 // Unit-radius primitives; actual radius applied per-mesh in rebuildScene
 // so the dowel-radius slider rescales without rebuilding geometry.
@@ -163,11 +206,23 @@ const edgeGeometry = new THREE.CylinderGeometry(1, 1, 1, 16, 1);
 // rectangle strips and a smaller corner rectangle.
 const MERGE_TOL = 0.05; // inches
 
+// Stable identity for a world position, surviving rebuilds as long as the
+// underlying geometry didn't itself move (e.g. dragging dowel radius or
+// picking a color doesn't change any node position, so removal state set
+// via click persists correctly; changing dimensions/tiling does move nodes,
+// so old removed-keys simply go stale/orphaned — expected, not a bug).
+function posKey(v) {
+  return Math.round(v.x * 100) + "," + Math.round(v.y * 100) + "," + Math.round(v.z * 100);
+}
+
 let nodes = []; // world positions (inches), y=0 at the floor
 let edges = []; // [nodeIndexA, nodeIndexB] — straight structural dowels
 let braceSegs = [];       // flat list of [Vec3, Vec3] cylinder segments for curved braces
+let braceSegMeta = [];    // parallel to braceSegs: { key, slot } — one physical brace instance per key
 let braceTypeCounts = {}; // brace function key -> count of cells using it
-let armDirs = []; // parallel to nodes — unit vectors of each connector's arms
+let armDirs = [];    // parallel to nodes — unit vectors of each connector's arms
+let armSources = []; // parallel to armDirs[i] — { kind: "dowel"|"brace", key } each arm came from,
+                      // so a removed dowel/brace can be excluded from that connector's effective arms
 let effRowSkip = 0, effColSkip = 0; // state.rowSkip/colSkip clamped to the current geometry
 
 // A brace lives in a unit (u,v) cell, v = up, spanning [0,1]x[0,1]. Returns
@@ -331,6 +386,7 @@ function generateFrame() {
   nodes = [];
   edges = [];
   braceSegs = [];
+  braceSegMeta = [];
   braceTypeCounts = {};
   const braceArms = [];
   const index = new Map();
@@ -378,7 +434,10 @@ function generateFrame() {
   const getLocal = (type) => (localCache[type] ||= buildBraceLocal(type));
 
   // c = [c00, c10, c01, c11] for cell corners (u,v) = (0,0),(1,0),(0,1),(1,1).
-  const emit = (c, type, flip) => {
+  // slot identifies which of the 3 independently-colored brace families this
+  // cell belongs to ("depth" | "row" | "col") and, combined with the corner
+  // positions, gives every physical brace instance a stable removal-state key.
+  const emit = (c, type, flip, slot) => {
     const local = getLocal(type);
     const U = (u) => (flip ? 1 - u : u);
     const to3D = (u, v) => {
@@ -389,13 +448,16 @@ function generateFrame() {
         .addScaledVector(c[2].pos, (1 - uu) * v)
         .addScaledVector(c[3].pos, uu * v);
     };
-    local.segs.forEach(([p, q]) =>
-      braceSegs.push([to3D(p[0], p[1]), to3D(q[0], q[1])]));
+    const instKey = slot + "|" + c.map((corner) => posKey(corner.pos)).sort().join("|");
+    local.segs.forEach(([p, q]) => {
+      braceSegs.push([to3D(p[0], p[1]), to3D(q[0], q[1])]);
+      braceSegMeta.push({ key: instKey, slot, type });
+    });
     local.arms.forEach(({ at, dir }) => {
       const id = c[(U(at[0]) ? 1 : 0) + (at[1] ? 2 : 0)].id;
       const p0 = to3D(at[0], at[1]);
       const p1 = to3D(at[0] + 0.001 * dir[0], at[1] + 0.001 * dir[1]);
-      braceArms.push({ id, dir: p1.sub(p0).normalize() });
+      braceArms.push({ id, dir: p1.sub(p0).normalize(), key: instKey });
     });
     braceTypeCounts[type] = (braceTypeCounts[type] || 0) + 1;
   };
@@ -407,7 +469,7 @@ function generateFrame() {
       for (let i = 0; i + 1 < xs.length; i++)
         for (let j = 0; j + 1 < ys.length; j++)
           if (isSquare(xs[i + 1] - xs[i], ys[j + 1] - ys[j]))
-            emit([nodeRef(i, j, k), nodeRef(i + 1, j, k), nodeRef(i, j + 1, k), nodeRef(i + 1, j + 1, k)], brace, braceFlip);
+            emit([nodeRef(i, j, k), nodeRef(i + 1, j, k), nodeRef(i, j + 1, k), nodeRef(i + 1, j + 1, k)], brace, braceFlip, "depth");
     }
   }
   // Side faces + column partitions — every z-y plane (exterior boundary
@@ -420,7 +482,7 @@ function generateFrame() {
       for (let k = 0; k + 1 < zs.length; k++)
         for (let j = 0; j + 1 < ys.length; j++)
           if (isSquare(zs[k + 1] - zs[k], ys[j + 1] - ys[j]))
-            emit([nodeRef(i, j, k), nodeRef(i, j, k + 1), nodeRef(i, j + 1, k), nodeRef(i, j + 1, k + 1)], state.colBrace, state.colBraceFlip);
+            emit([nodeRef(i, j, k), nodeRef(i, j, k + 1), nodeRef(i, j + 1, k), nodeRef(i, j + 1, k + 1)], state.colBrace, state.colBraceFlip, "col");
     }
   }
   // Top/bottom faces + row decks — every x-z plane (exterior boundary AND
@@ -432,30 +494,65 @@ function generateFrame() {
       for (let i = 0; i + 1 < xs.length; i++)
         for (let k = 0; k + 1 < zs.length; k++)
           if (isSquare(xs[i + 1] - xs[i], zs[k + 1] - zs[k]))
-            emit([nodeRef(i, j, k), nodeRef(i + 1, j, k), nodeRef(i, j, k + 1), nodeRef(i + 1, j, k + 1)], state.rowBrace, state.rowBraceFlip);
+            emit([nodeRef(i, j, k), nodeRef(i + 1, j, k), nodeRef(i, j, k + 1), nodeRef(i + 1, j, k + 1)], state.rowBrace, state.rowBraceFlip, "row");
     }
   }
 
   // Arm directions per connector — straight rails plus brace endpoints —
   // feeds both the socket-stub geometry and the parts-list classifier.
+  // armSources tags each arm with the dowel/brace it came from, so a
+  // connector's *effective* arms (below) can exclude ones whose dowel or
+  // brace has been individually removed.
   armDirs = nodes.map(() => []);
+  armSources = nodes.map(() => []);
   edges.forEach(([ai, bi]) => {
     const dir = new THREE.Vector3().subVectors(nodes[bi], nodes[ai]).normalize();
+    const key = dowelKey(ai, bi);
     armDirs[ai].push(dir);
+    armSources[ai].push({ kind: "dowel", key });
     armDirs[bi].push(dir.clone().negate());
+    armSources[bi].push({ kind: "dowel", key });
   });
-  braceArms.forEach(({ id, dir }) => armDirs[id].push(dir));
+  braceArms.forEach(({ id, dir, key }) => {
+    armDirs[id].push(dir);
+    armSources[id].push({ kind: "brace", key });
+  });
+}
+
+// A connector's arms minus any whose source dowel/brace is individually
+// removed — this is what classification/rendering should actually see, not
+// the full authored geometry, so a removed brace's socket stops showing up
+// on the connector it used to plug into.
+function effectiveArmDirs(i) {
+  const dirs = armDirs[i], sources = armSources[i];
+  const out = [];
+  for (let k = 0; k < dirs.length; k++) {
+    const src = sources[k];
+    const removed = src.kind === "dowel" ? state.removedDowels.has(src.key) : state.removedBraces.has(src.key);
+    if (!removed) out.push(dirs[k]);
+  }
+  return out;
+}
+// A connector counts as removed either because it was explicitly clicked,
+// or because every arm touching it has been removed out from under it —
+// an orphaned hub with nothing plugged in serves no purpose, so it drops
+// out of the view/BOM automatically rather than needing a separate click.
+function isConnectorEffectivelyRemoved(i) {
+  return state.removedConnectors.has(connKey(i)) || effectiveArmDirs(i).length === 0;
 }
 
 // Mesh pools — reused across rebuilds so slider drags don't churn objects.
-const hubPool = [];
-const stubPool = [];
-const edgePool = [];
-const bracePool = [];
+// Each visible pool has a parallel "outline" pool: a slightly-scaled
+// backface-only shell that reads as a rim around the original when shown —
+// the mechanism behind the removed/hover visual states, with no
+// post-processing pass and no change to the existing render loop.
+const hubPool = [], hubOutlinePool = [];
+const stubPool = [], stubOutlinePool = [];
+const edgePool = [], edgeOutlinePool = [];
+const bracePool = [], braceOutlinePool = [];
+const OUTLINE_SCALE = 1.15;
 
 const UP = new THREE.Vector3(0, 1, 0);
-const _a = new THREE.Vector3();
-const _b = new THREE.Vector3();
 const _dir = new THREE.Vector3();
 const _mid = new THREE.Vector3();
 const _quat = new THREE.Quaternion();
@@ -471,76 +568,231 @@ function orientCylinder(mesh, a, b, radius) {
   mesh.scale.set(radius, len, radius);
 }
 
+function ensurePool(pool, count, geometry, material) {
+  while (pool.length < count) {
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.visible = false;
+    scene.add(mesh);
+    pool.push(mesh);
+  }
+  pool.forEach((mesh, i) => {
+    mesh.visible = i < count;
+  });
+}
+
+function connKey(i) {
+  return posKey(nodes[i]);
+}
+function dowelKey(ai, bi) {
+  const a = posKey(nodes[ai]), b = posKey(nodes[bi]);
+  return a < b ? a + "|" + b : b + "|" + a;
+}
+
+// key -> the pool indices making up that physical element, rebuilt every
+// rebuildScene() call. meshToElement is the reverse direction, used by the
+// raycaster to resolve a hit mesh back to an element identity.
+let connectorIndex = new Map(); // key -> { hubI, stubIs: [] }
+let dowelIndex = new Map();     // key -> edgeI
+let braceIndex = new Map();     // key -> { segIs: [], slot }
+let meshToElement = new Map();  // mesh -> { kind, key }
+
 function rebuildScene() {
   generateFrame();
   const r = state.dowelRadius;
-  const hubR = r * HUB_TO_DOWEL_RATIO;
+  const isBlob = state.connectorType === "blob";
+  const hubR = r * (isBlob ? BLOB_TO_DOWEL_RATIO : HUB_TO_DOWEL_RATIO);
   const stubR = r * STUB_RADIUS_RATIO;
   const stubLen = hubR * STUB_LENGTH_RATIO;
 
-  while (hubPool.length < nodes.length) {
-    const mesh = new THREE.Mesh(hubGeometry, connectorMaterial);
-    scene.add(mesh);
-    hubPool.push(mesh);
-  }
-  hubPool.forEach((mesh, i) => {
-    mesh.visible = i < nodes.length;
-    if (!mesh.visible) return;
-    mesh.position.copy(nodes[i]);
-    mesh.scale.setScalar(hubR);
+  connectorIndex = new Map();
+  dowelIndex = new Map();
+  braceIndex = new Map();
+  meshToElement = new Map();
+
+  // ---- connectors: hub always; socket stubs only in "T" mode — "blob"
+  // mode relies on the bigger hub alone to read as a solid rounded mass ----
+  ensurePool(hubPool, nodes.length, hubGeometry, connectorMaterial);
+  ensurePool(hubOutlinePool, nodes.length, hubGeometry, outlineMaterial);
+  nodes.forEach((pos, i) => {
+    hubPool[i].position.copy(pos);
+    hubPool[i].scale.setScalar(hubR);
+    hubOutlinePool[i].position.copy(pos);
+    hubOutlinePool[i].scale.setScalar(hubR * OUTLINE_SCALE);
+    meshToElement.set(hubPool[i], { kind: "connector", key: connKey(i) });
+    connectorIndex.set(connKey(i), { hubI: i, stubIs: [] });
   });
 
-  // Socket stubs: one short collar per arm, so each connector reads as a
-  // hub with sockets radiating out — not a bare ball joint.
-  const stubList = [];
-  armDirs.forEach((dirs, i) => {
-    dirs.forEach((dir) => stubList.push({ pos: nodes[i], dir }));
-  });
-
-  while (stubPool.length < stubList.length) {
-    const mesh = new THREE.Mesh(edgeGeometry, connectorMaterial);
-    scene.add(mesh);
-    stubPool.push(mesh);
+  const stubList = []; // { pos, dir, nodeIndex }
+  if (!isBlob) {
+    nodes.forEach((pos, i) => effectiveArmDirs(i).forEach((dir) => stubList.push({ pos, dir, nodeIndex: i })));
   }
-  stubPool.forEach((mesh, i) => {
-    mesh.visible = i < stubList.length;
-    if (!mesh.visible) return;
-    const { pos, dir } = stubList[i];
+  ensurePool(stubPool, stubList.length, edgeGeometry, connectorMaterial);
+  ensurePool(stubOutlinePool, stubList.length, edgeGeometry, outlineMaterial);
+  stubList.forEach(({ pos, dir, nodeIndex }, i) => {
     _quat.setFromUnitVectors(UP, dir);
+    const mesh = stubPool[i], outline = stubOutlinePool[i];
     mesh.position.copy(pos).addScaledVector(dir, stubLen / 2);
     mesh.quaternion.copy(_quat);
     mesh.scale.set(stubR, stubLen, stubR);
+    outline.position.copy(mesh.position);
+    outline.quaternion.copy(_quat);
+    outline.scale.set(stubR * OUTLINE_SCALE, stubLen, stubR * OUTLINE_SCALE);
+    const key = connKey(nodeIndex);
+    meshToElement.set(mesh, { kind: "connector", key });
+    connectorIndex.get(key).stubIs.push(i);
   });
 
-  while (edgePool.length < edges.length) {
-    const mesh = new THREE.Mesh(edgeGeometry, edgeMaterial);
-    scene.add(mesh);
-    edgePool.push(mesh);
-  }
-  edgePool.forEach((mesh, i) => {
-    mesh.visible = i < edges.length;
-    if (!mesh.visible) return;
-    const [ai, bi] = edges[i];
-    orientCylinder(mesh, nodes[ai], nodes[bi], r);
+  // ---- dowels ----
+  ensurePool(edgePool, edges.length, edgeGeometry, edgeMaterial);
+  ensurePool(edgeOutlinePool, edges.length, edgeGeometry, outlineMaterial);
+  edges.forEach(([ai, bi], i) => {
+    orientCylinder(edgePool[i], nodes[ai], nodes[bi], r);
+    orientCylinder(edgeOutlinePool[i], nodes[ai], nodes[bi], r * OUTLINE_SCALE);
+    const key = dowelKey(ai, bi);
+    meshToElement.set(edgePool[i], { kind: "dowel", key });
+    dowelIndex.set(key, i);
   });
 
-  // Curved function braces — one cylinder per sampled segment, thinner than
-  // the structural dowels and rendered in the purple brace accent.
+  // ---- curved function braces — one cylinder per sampled segment ----
   const braceR = r * 0.8;
-  while (bracePool.length < braceSegs.length) {
-    const mesh = new THREE.Mesh(edgeGeometry, braceMaterial);
-    scene.add(mesh);
-    bracePool.push(mesh);
-  }
-  bracePool.forEach((mesh, i) => {
-    mesh.visible = i < braceSegs.length;
-    if (!mesh.visible) return;
-    orientCylinder(mesh, braceSegs[i][0], braceSegs[i][1], braceR);
+  ensurePool(bracePool, braceSegs.length, edgeGeometry, braceMaterialBySlot.depth);
+  ensurePool(braceOutlinePool, braceSegs.length, edgeGeometry, outlineMaterial);
+  braceSegs.forEach(([a, b], i) => {
+    orientCylinder(bracePool[i], a, b, braceR);
+    orientCylinder(braceOutlinePool[i], a, b, braceR * OUTLINE_SCALE);
+    const { key, slot } = braceSegMeta[i];
+    meshToElement.set(bracePool[i], { kind: "brace", key });
+    const entry = braceIndex.get(key) || { segIs: [], slot };
+    entry.segIs.push(i);
+    braceIndex.set(key, entry);
   });
 
+  applyAllVisualStates();
   controls.target.set(0, state.height / 2, 0);
 }
+
+// ---------- removed / hover visual states ----------
+// 3 states per element: added (normal color, no outline), removed (gray
+// fill + outline), hover (temporary preview — outline always, fill flips
+// to the *other* state's color: gray if currently added, real color if
+// currently removed). hovered tracks at most one element at a time.
+
+function isElementRemoved(kind, key) {
+  if (kind === "connector") {
+    const entry = connectorIndex.get(key);
+    return entry ? isConnectorEffectivelyRemoved(entry.hubI) : state.removedConnectors.has(key);
+  }
+  const set = kind === "dowel" ? state.removedDowels : state.removedBraces;
+  return set.has(key);
+}
+
+let hovered = null; // { kind, key } | null
+
+function applyElementVisual(kind, key) {
+  const removedActual = isElementRemoved(kind, key);
+  const isHover = !!hovered && hovered.kind === kind && hovered.key === key;
+  const showRemoved = isHover ? !removedActual : removedActual;
+  const showOutline = removedActual || isHover;
+
+  if (kind === "connector") {
+    const entry = connectorIndex.get(key);
+    if (!entry) return;
+    const mat = showRemoved ? grayMaterial : connectorMaterial;
+    hubPool[entry.hubI].material = mat;
+    hubOutlinePool[entry.hubI].visible = showOutline;
+    entry.stubIs.forEach((i) => {
+      stubPool[i].material = mat;
+      stubOutlinePool[i].visible = showOutline;
+    });
+  } else if (kind === "dowel") {
+    const i = dowelIndex.get(key);
+    if (i === undefined) return;
+    edgePool[i].material = showRemoved ? grayMaterial : edgeMaterial;
+    edgeOutlinePool[i].visible = showOutline;
+  } else if (kind === "brace") {
+    const entry = braceIndex.get(key);
+    if (!entry) return;
+    const mat = showRemoved ? grayMaterial : braceMaterialBySlot[entry.slot];
+    entry.segIs.forEach((i) => {
+      bracePool[i].material = mat;
+      braceOutlinePool[i].visible = showOutline;
+    });
+  }
+}
+
+function applyAllVisualStates() {
+  connectorIndex.forEach((_, key) => applyElementVisual("connector", key));
+  dowelIndex.forEach((_, key) => applyElementVisual("dowel", key));
+  braceIndex.forEach((_, key) => applyElementVisual("brace", key));
+}
+
 rebuildScene();
+
+// ---------- click-to-remove / hover preview ----------
+
+const raycaster = new THREE.Raycaster();
+const pointerNDC = new THREE.Vector2();
+
+function pickableMeshes() {
+  const list = [];
+  hubPool.forEach((m) => m.visible && list.push(m));
+  stubPool.forEach((m) => m.visible && list.push(m));
+  edgePool.forEach((m) => m.visible && list.push(m));
+  bracePool.forEach((m) => m.visible && list.push(m));
+  return list;
+}
+
+function pickAt(clientX, clientY) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  pointerNDC.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+  pointerNDC.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(pointerNDC, camera);
+  const hits = raycaster.intersectObjects(pickableMeshes(), false);
+  return hits.length ? meshToElement.get(hits[0].object) || null : null;
+}
+
+function setHovered(next) {
+  const same = hovered && next && hovered.kind === next.kind && hovered.key === next.key;
+  if (same) return;
+  const prev = hovered;
+  hovered = next;
+  if (prev) applyElementVisual(prev.kind, prev.key);
+  if (next) applyElementVisual(next.kind, next.key);
+  renderer.domElement.style.cursor = next ? "pointer" : "";
+}
+
+renderer.domElement.addEventListener("pointermove", (e) => {
+  if (e.buttons) return; // a held button means an orbit/pan drag — don't fight OrbitControls
+  setHovered(pickAt(e.clientX, e.clientY));
+});
+renderer.domElement.addEventListener("pointerleave", () => setHovered(null));
+
+let pointerDownPos = null;
+renderer.domElement.addEventListener("pointerdown", (e) => {
+  pointerDownPos = [e.clientX, e.clientY];
+});
+renderer.domElement.addEventListener("pointerup", (e) => {
+  if (!pointerDownPos) return;
+  const dx = e.clientX - pointerDownPos[0], dy = e.clientY - pointerDownPos[1];
+  pointerDownPos = null;
+  if (dx * dx + dy * dy > 16) return; // moved more than a few px — an orbit drag, not a click
+  const el = pickAt(e.clientX, e.clientY);
+  if (!el) return;
+  const set = el.kind === "connector" ? state.removedConnectors : el.kind === "dowel" ? state.removedDowels : state.removedBraces;
+  if (set.has(el.key)) set.delete(el.key); else set.add(el.key);
+  if (el.kind === "connector") {
+    // Removing a connector doesn't change anyone else's arm count — a
+    // targeted material/outline patch is enough, no need to touch geometry.
+    applyElementVisual(el.kind, el.key);
+  } else {
+    // Removing a dowel or brace can shrink (or restore) the socket count on
+    // the connector(s) it plugs into, and may orphan one to zero arms —
+    // that changes actual stub geometry, so it needs a real rebuild, not
+    // just a visual patch. Same cost as a slider drag; not a concern.
+    rebuildScene();
+  }
+  updateExport();
+});
 
 // ---------- UI wiring ----------
 
@@ -590,6 +842,19 @@ const el = {
   exportBtn: document.getElementById("exportBtn"),
   saveAsBtn: document.getElementById("saveAsBtn"),
   loadFile: document.getElementById("loadFile"),
+  connTypeSel: document.getElementById("connTypeSel"),
+  connSwatch: document.getElementById("connSwatch"),
+  braceSwatch: document.getElementById("braceSwatch"),
+  rowBraceSwatch: document.getElementById("rowBraceSwatch"),
+  colBraceSwatch: document.getElementById("colBraceSwatch"),
+  dwlSwatch: document.getElementById("dwlSwatch"),
+  colorPicker: document.getElementById("colorPicker"),
+  colorWheel: document.getElementById("colorWheel"),
+  colorWheelKnob: document.getElementById("colorWheelKnob"),
+  colorBright: document.getElementById("colorBright"),
+  colorHex: document.getElementById("colorHex"),
+  colorPreview: document.getElementById("colorPreview"),
+  recentColorsRow: document.getElementById("recentColorsRow"),
 };
 
 function formatPrimary(inches) {
@@ -882,11 +1147,15 @@ function computeParts() {
   // Unitless (direction vectors, local u/v curve coords) — just trims float noise.
   const round4 = (v) => Math.round(v * 10000) / 10000;
 
+  // Removed elements (toggled via click in the 3D view) don't need to be
+  // printed — excluded from every count/breakdown below.
   const byLength = new Map();
-  edges.forEach(([ai, bi]) => {
+  edges.forEach(([ai, bi], i) => {
+    if (state.removedDowels.has(dowelKey(ai, bi))) return;
     const len = toUnit(nodes[ai].distanceTo(nodes[bi]));
     byLength.set(len, (byLength.get(len) || 0) + 1);
   });
+  const dowelCount = [...byLength.values()].reduce((a, b) => a + b, 0);
 
   // One representative arm-vector set per distinct connector type — every
   // node classified the same way has congruent arm geometry (that's what
@@ -894,7 +1163,9 @@ function computeParts() {
   // pipeline needs per type, not one per node.
   const byType = new Map();
   const typeArmVectors = new Map();
-  armDirs.forEach((dirs) => {
+  armDirs.forEach((_, i) => {
+    if (isConnectorEffectivelyRemoved(i)) return;
+    const dirs = effectiveArmDirs(i);
     const type = classifyConnector(dirs);
     byType.set(type, (byType.get(type) || 0) + 1);
     if (!typeArmVectors.has(type)) {
@@ -903,6 +1174,17 @@ function computeParts() {
         dirs.map((d) => ({ x: round4(d.x), y: round4(d.y), z: round4(d.z) }))
       );
     }
+  });
+  const connectorCount = [...byType.values()].reduce((a, b) => a + b, 0);
+
+  // Braces: count each physical instance (keyed the same way as the
+  // removal-state click target) once, not once per rendered segment.
+  const filteredBraceTypeCounts = {};
+  const seenBraceInstances = new Set();
+  braceSegMeta.forEach(({ key, type }) => {
+    if (state.removedBraces.has(key) || seenBraceInstances.has(key)) return;
+    seenBraceInstances.add(key);
+    filteredBraceTypeCounts[type] = (filteredBraceTypeCounts[type] || 0) + 1;
   });
 
   return {
@@ -926,7 +1208,7 @@ function computeParts() {
       openFront: state.openFront,
     },
     connectors: {
-      count: nodes.length,
+      count: connectorCount,
       // hubRadius is informational (dowelRadius * HUB_TO_DOWEL_RATIO) — the
       // socket ID a fabrication pipeline should actually cut is a printing
       // tolerance decision (see connectors_v1: dowel diameter + ~0.3mm/side
@@ -937,7 +1219,7 @@ function computeParts() {
         .map(([type, count]) => ({ type, count, armVectors: typeArmVectors.get(type) })),
     },
     dowels: {
-      count: edges.length,
+      count: dowelCount,
       radius: toFine(state.dowelRadius),
       diameter: toFine(state.dowelRadius * 2),
       byLength: [...byLength.entries()]
@@ -945,7 +1227,7 @@ function computeParts() {
         .map(([length, count]) => ({ length, count })),
     },
     braces: {
-      count: Object.values(braceTypeCounts).reduce((a, b) => a + b, 0),
+      count: Object.values(filteredBraceTypeCounts).reduce((a, b) => a + b, 0),
       // polyline/arms are in local unit-cell (u,v) coords, u,v in [0,1] —
       // scale by cellSize (same unit as the rest of this export) to get
       // real-world points. A flipped brace is the same physical part
@@ -953,7 +1235,7 @@ function computeParts() {
       // create a second entry here (verified: every brace cell is planar,
       // and a planar curve's mirror image is always reachable by physically
       // turning the printed part over).
-      byType: Object.entries(braceTypeCounts)
+      byType: Object.entries(filteredBraceTypeCounts)
         .sort((a, b) => b[1] - a[1])
         .map(([key, count]) => {
           const local = buildBraceLocal(key);
@@ -971,6 +1253,14 @@ function computeParts() {
         }),
     },
   };
+}
+
+function hexNumToStr(n) {
+  return "#" + Math.max(0, Math.min(0xffffff, n | 0)).toString(16).padStart(6, "0");
+}
+function hexStrToNum(s, fallback) {
+  const m = /^#?([0-9a-fA-F]{6})$/.exec(s || "");
+  return m ? parseInt(m[1], 16) : fallback;
 }
 
 // A project file captures every parameter needed to exactly reproduce this
@@ -994,6 +1284,15 @@ function serializeState() {
     rowSkip: state.rowSkip,
     colSkip: state.colSkip,
     openFront: state.openFront,
+    connectorType: state.connectorType,
+    connectorColor: hexNumToStr(state.connectorColor),
+    dowelColor: hexNumToStr(state.dowelColor),
+    braceColor: hexNumToStr(state.braceColor),
+    rowBraceColor: hexNumToStr(state.rowBraceColor),
+    colBraceColor: hexNumToStr(state.colBraceColor),
+    removedConnectors: [...state.removedConnectors],
+    removedDowels: [...state.removedDowels],
+    removedBraces: [...state.removedBraces],
   };
 }
 
@@ -1024,6 +1323,21 @@ function applyLoadedState(obj) {
   state.colSkip = clampNum(obj.colSkip, 0, 999, state.colSkip);
   state.openFront = bool(obj.openFront, state.openFront);
 
+  state.connectorType = obj.connectorType === "blob" ? "blob" : "T";
+  state.connectorColor = hexStrToNum(obj.connectorColor, state.connectorColor);
+  state.dowelColor = hexStrToNum(obj.dowelColor, state.dowelColor);
+  state.braceColor = hexStrToNum(obj.braceColor, state.braceColor);
+  state.rowBraceColor = hexStrToNum(obj.rowBraceColor, state.rowBraceColor);
+  state.colBraceColor = hexStrToNum(obj.colBraceColor, state.colBraceColor);
+  setMaterialColor(connectorMaterial, state.connectorColor);
+  setMaterialColor(edgeMaterial, state.dowelColor);
+  setMaterialColor(braceMaterialBySlot.depth, state.braceColor);
+  setMaterialColor(braceMaterialBySlot.row, state.rowBraceColor);
+  setMaterialColor(braceMaterialBySlot.col, state.colBraceColor);
+  state.removedConnectors = new Set(Array.isArray(obj.removedConnectors) ? obj.removedConnectors : []);
+  state.removedDowels = new Set(Array.isArray(obj.removedDowels) ? obj.removedDowels : []);
+  state.removedBraces = new Set(Array.isArray(obj.removedBraces) ? obj.removedBraces : []);
+
   el.wid.value = state.width;
   el.hgt.value = state.height;
   el.dep.value = state.depth;
@@ -1033,6 +1347,7 @@ function applyLoadedState(obj) {
 
   filenameDirty = false; // a freshly-loaded project re-derives its filename
   syncStructureUI();
+  syncColorSwatches();
   rebuildScene();
   updateLabels();
 }
@@ -1359,7 +1674,217 @@ function syncStructureUI() {
   el.colBraceFlip.textContent = state.colBraceFlip ? "\\" : "/";
   el.colBraceFlip.disabled = state.colBrace === "off";
   el.openFrontBtn.classList.toggle("active", state.openFront);
+  el.connTypeSel.value = state.connectorType;
 }
+
+// Sets a swatch button's background to the given color, picking a readable
+// text color (dark-on-light or light-on-dark) by relative luminance so the
+// label stays legible across the full color range.
+function paintSwatch(btn, hexNum) {
+  const hex = hexNumToStr(hexNum);
+  btn.style.background = hex;
+  const r = (hexNum >> 16) & 255, g = (hexNum >> 8) & 255, b = hexNum & 255;
+  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  btn.style.color = luminance > 0.55 ? "#14140f" : "#f2ede0";
+}
+
+function syncColorSwatches() {
+  paintSwatch(el.connSwatch, state.connectorColor);
+  paintSwatch(el.dwlSwatch, state.dowelColor);
+  paintSwatch(el.braceSwatch, state.braceColor);
+  paintSwatch(el.rowBraceSwatch, state.rowBraceColor);
+  paintSwatch(el.colBraceSwatch, state.colBraceColor);
+}
+syncColorSwatches();
+
+el.connTypeSel.addEventListener("change", () => {
+  state.connectorType = el.connTypeSel.value === "blob" ? "blob" : "T";
+  rebuildScene();
+  updateLabels();
+});
+
+// ---------- color picker: hue/saturation wheel + brightness + hex + recents ----------
+
+function hsvToRgb(h, s, v) {
+  const c = v * s, x = c * (1 - Math.abs(((h / 60) % 2) - 1)), m = v - c;
+  let r, g, b;
+  if (h < 60) [r, g, b] = [c, x, 0];
+  else if (h < 120) [r, g, b] = [x, c, 0];
+  else if (h < 180) [r, g, b] = [0, c, x];
+  else if (h < 240) [r, g, b] = [0, x, c];
+  else if (h < 300) [r, g, b] = [x, 0, c];
+  else [r, g, b] = [c, 0, x];
+  return [Math.round((r + m) * 255), Math.round((g + m) * 255), Math.round((b + m) * 255)];
+}
+function rgbToHsv(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  let h = 0;
+  if (d !== 0) {
+    if (max === r) h = 60 * (((g - b) / d) % 6);
+    else if (max === g) h = 60 * ((b - r) / d + 2);
+    else h = 60 * ((r - g) / d + 4);
+  }
+  if (h < 0) h += 360;
+  return [h, max === 0 ? 0 : d / max, max];
+}
+function rgbToHexNum(r, g, b) {
+  return (r << 16) | (g << 8) | b;
+}
+
+let pickerState = null; // { h, s, v, onChange } while the popover is open
+
+function drawColorWheel() {
+  const canvas = el.colorWheel;
+  const size = canvas.width;
+  const ctx = canvas.getContext("2d");
+  const img = ctx.createImageData(size, size);
+  const cx = size / 2, cy = size / 2, radius = size / 2;
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const dx = x - cx, dy = y - cy;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      const idx = (y * size + x) * 4;
+      if (dist > radius) continue; // leave alpha 0 — transparent outside the disc
+      let angle = (Math.atan2(dy, dx) * 180) / Math.PI;
+      if (angle < 0) angle += 360;
+      const [r, g, b] = hsvToRgb(angle, Math.min(1, dist / radius), 1);
+      img.data[idx] = r;
+      img.data[idx + 1] = g;
+      img.data[idx + 2] = b;
+      img.data[idx + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+}
+drawColorWheel();
+
+function updateKnobPosition() {
+  const radius = el.colorWheel.clientWidth / 2;
+  const rad = (pickerState.h * Math.PI) / 180;
+  el.colorWheelKnob.style.left = radius + Math.cos(rad) * pickerState.s * radius + "px";
+  el.colorWheelKnob.style.top = radius + Math.sin(rad) * pickerState.s * radius + "px";
+}
+function currentPickerHex() {
+  const [r, g, b] = hsvToRgb(pickerState.h, pickerState.s, pickerState.v);
+  return rgbToHexNum(r, g, b);
+}
+function refreshPickerUI(fromHexInput) {
+  const hexNum = currentPickerHex();
+  updateKnobPosition();
+  const [r, g, b] = hsvToRgb(pickerState.h, pickerState.s, 1);
+  el.colorBright.style.background = `linear-gradient(to right, #000, rgb(${r},${g},${b}))`;
+  el.colorPreview.style.background = hexNumToStr(hexNum);
+  if (!fromHexInput) el.colorHex.value = hexNumToStr(hexNum);
+  el.colorBright.value = Math.round(pickerState.v * 100);
+  if (pickerState.onChange) pickerState.onChange(hexNum);
+}
+
+function renderRecentColors() {
+  el.recentColorsRow.innerHTML = "";
+  recentColors.forEach((hex) => {
+    const sw = document.createElement("button");
+    sw.className = "recentSwatch";
+    sw.style.background = hex;
+    sw.addEventListener("click", () => {
+      const n = hexStrToNum(hex, currentPickerHex());
+      const [h, s, v] = rgbToHsv((n >> 16) & 255, (n >> 8) & 255, n & 255);
+      pickerState.h = h; pickerState.s = s; pickerState.v = v;
+      refreshPickerUI();
+    });
+    el.recentColorsRow.appendChild(sw);
+  });
+}
+
+function wheelPointerToHS(clientX, clientY) {
+  const rect = el.colorWheel.getBoundingClientRect();
+  const dx = clientX - (rect.left + rect.width / 2);
+  const dy = clientY - (rect.top + rect.height / 2);
+  let angle = (Math.atan2(dy, dx) * 180) / Math.PI;
+  if (angle < 0) angle += 360;
+  return [angle, Math.min(1, Math.sqrt(dx * dx + dy * dy) / (rect.width / 2))];
+}
+
+let wheelDragging = false;
+el.colorWheel.addEventListener("pointerdown", (e) => {
+  wheelDragging = true;
+  el.colorWheel.setPointerCapture(e.pointerId);
+  [pickerState.h, pickerState.s] = wheelPointerToHS(e.clientX, e.clientY);
+  refreshPickerUI();
+});
+el.colorWheel.addEventListener("pointermove", (e) => {
+  if (!wheelDragging) return;
+  [pickerState.h, pickerState.s] = wheelPointerToHS(e.clientX, e.clientY);
+  refreshPickerUI();
+});
+window.addEventListener("pointerup", () => { wheelDragging = false; });
+
+el.colorBright.addEventListener("input", () => {
+  pickerState.v = el.colorBright.value / 100;
+  refreshPickerUI();
+});
+
+el.colorHex.addEventListener("input", () => {
+  const n = hexStrToNum(el.colorHex.value, null);
+  if (n === null) return;
+  [pickerState.h, pickerState.s, pickerState.v] = rgbToHsv((n >> 16) & 255, (n >> 8) & 255, n & 255);
+  refreshPickerUI(true);
+});
+
+function openColorPicker(anchorEl, currentHexNum, onChange) {
+  const [h, s, v] = rgbToHsv((currentHexNum >> 16) & 255, (currentHexNum >> 8) & 255, currentHexNum & 255);
+  pickerState = { h, s, v, onChange };
+
+  // display must flip to "block" before anything reads layout (clientWidth
+  // etc.) — while display:none, every child reports 0, which is exactly
+  // what was sending the wheel knob to (0,0) on every open.
+  el.colorPicker.style.display = "block";
+  renderRecentColors();
+  refreshPickerUI();
+
+  const rect = anchorEl.getBoundingClientRect();
+  const popW = el.colorPicker.offsetWidth || 190;
+  const popH = el.colorPicker.offsetHeight || 380;
+  const left = Math.max(8, Math.min(rect.left, window.innerWidth - popW - 8));
+  // Prefer opening below the anchor; flip above if it wouldn't fit, then
+  // clamp either way so it's never pushed off the top or bottom edge.
+  let top = rect.bottom + 8;
+  if (top + popH > window.innerHeight - 8) top = rect.top - popH - 8;
+  top = Math.max(8, Math.min(top, window.innerHeight - popH - 8));
+  el.colorPicker.style.left = left + "px";
+  el.colorPicker.style.top = top + "px";
+}
+
+function closeColorPicker(commit) {
+  if (!pickerState) return;
+  if (commit) pushRecentColor(hexNumToStr(currentPickerHex()));
+  pickerState = null;
+  el.colorPicker.style.display = "none";
+}
+
+el.colorPicker.addEventListener("pointerdown", (e) => e.stopPropagation());
+document.addEventListener("pointerdown", (e) => {
+  if (pickerState && !el.colorPicker.contains(e.target)) closeColorPicker(true);
+});
+document.addEventListener("keydown", (e) => {
+  if (pickerState && e.key === "Escape") closeColorPicker(true);
+});
+
+function bindColorSwatch(swatchEl, getHex, setHex) {
+  swatchEl.addEventListener("pointerdown", (e) => e.stopPropagation());
+  swatchEl.addEventListener("click", () => {
+    openColorPicker(swatchEl, getHex(), (hexNum) => {
+      setHex(hexNum);
+      syncColorSwatches();
+    });
+  });
+}
+
+bindColorSwatch(el.connSwatch, () => state.connectorColor, (n) => { state.connectorColor = n; setMaterialColor(connectorMaterial, n); });
+bindColorSwatch(el.dwlSwatch, () => state.dowelColor, (n) => { state.dowelColor = n; setMaterialColor(edgeMaterial, n); });
+bindColorSwatch(el.braceSwatch, () => state.braceColor, (n) => { state.braceColor = n; setMaterialColor(braceMaterialBySlot.depth, n); });
+bindColorSwatch(el.rowBraceSwatch, () => state.rowBraceColor, (n) => { state.rowBraceColor = n; setMaterialColor(braceMaterialBySlot.row, n); });
+bindColorSwatch(el.colBraceSwatch, () => state.colBraceColor, (n) => { state.colBraceColor = n; setMaterialColor(braceMaterialBySlot.col, n); });
 
 function bindBraceControl(sel, flipBtn, braceKey, flipKey) {
   sel.addEventListener("change", () => {
@@ -1434,6 +1959,30 @@ function randomizeStructure() {
   updateLabels();
 }
 
+// Random hue at a constrained saturation/value range — avoids the muddy or
+// neon-garish results of uniform RGB random while still covering the full
+// color wheel.
+function randomNiceColor() {
+  const [r, g, b] = hsvToRgb(randFloat(0, 360), randFloat(0.45, 0.85), randFloat(0.55, 0.95));
+  return rgbToHexNum(r, g, b);
+}
+
+// Colors change far less often than everything else the shuffle button
+// touches — each of the 5 is independently re-rolled at a low probability,
+// so most shuffles leave colors alone and only occasionally nudge one.
+const COLOR_SHUFFLE_CHANCE = 0.18;
+function randomizeColors() {
+  const maybe = (setter) => {
+    if (Math.random() < COLOR_SHUFFLE_CHANCE) setter(randomNiceColor());
+  };
+  maybe((c) => { state.connectorColor = c; setMaterialColor(connectorMaterial, c); });
+  maybe((c) => { state.dowelColor = c; setMaterialColor(edgeMaterial, c); });
+  maybe((c) => { state.braceColor = c; setMaterialColor(braceMaterialBySlot.depth, c); });
+  maybe((c) => { state.rowBraceColor = c; setMaterialColor(braceMaterialBySlot.row, c); });
+  maybe((c) => { state.colBraceColor = c; setMaterialColor(braceMaterialBySlot.col, c); });
+  syncColorSwatches();
+}
+
 // Order matters: tiling's division range and structure's skip ranges both
 // depend on the current dimensions, and structure's skip range also
 // depends on square size — so dimensions, then tiling, then structure.
@@ -1441,6 +1990,7 @@ function randomizeAll() {
   randomizeDimensions();
   randomizeTiling();
   randomizeStructure();
+  randomizeColors();
 }
 
 el.shuffleDims.addEventListener("click", randomizeDimensions);
@@ -1473,11 +2023,10 @@ window.addEventListener("resize", () => {
   drawRowColPad();
 });
 
+const shaderMaterials = [connectorMaterial, edgeMaterial, grayMaterial, ...Object.values(braceMaterialBySlot)];
 function animate() {
   requestAnimationFrame(animate);
-  connectorMaterial.uniforms.cameraPos.value.copy(camera.position);
-  edgeMaterial.uniforms.cameraPos.value.copy(camera.position);
-  braceMaterial.uniforms.cameraPos.value.copy(camera.position);
+  shaderMaterials.forEach((mat) => mat.uniforms.cameraPos.value.copy(camera.position));
   controls.update();
   renderer.render(scene, camera);
 }
