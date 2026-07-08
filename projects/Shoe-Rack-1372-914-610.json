@@ -1,0 +1,19 @@
+{
+  "app": "cartesian-shelf",
+  "version": 1,
+  "unit": "in",
+  "width": 25,
+  "height": 11,
+  "depth": 11,
+  "dowelRadius": 0.5,
+  "squareSize": 11.040655339805825,
+  "brace": "cubic",
+  "braceFlip": true,
+  "rowBrace": "identity",
+  "rowBraceFlip": true,
+  "colBrace": "circle",
+  "colBraceFlip": true,
+  "rowSkip": 0,
+  "colSkip": 2,
+  "openFront": true
+}
